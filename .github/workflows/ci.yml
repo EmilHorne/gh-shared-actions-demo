@@ -110,9 +110,19 @@ jobs:
       # events here to correlate against the variation served there.
       CI_JOB_ID: ${{ needs.evaluate-flags.outputs.ci-job-id }}
     steps:
-      # Each step pins its @ref by concatenating the action name prefix with
-      # the version resolved by the evaluate-flags job. Two separate LD flags
-      # means the two shared actions roll out independently.
+      # Checkout is needed because the SAST and secret-scan steps below invoke
+      # *local* wrapper composite actions (./.github/actions/...-wrapper), and
+      # local action paths are resolved against the checked-out workspace.
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      # Each scan step invokes a local wrapper composite action with a STATIC
+      # `uses:` path and the LD-resolved version passed as a `with:` input.
+      # This indirection is required because GitHub Actions resolves step-level
+      # `uses:` refs at workflow-parse time and rejects expressions referencing
+      # `steps`, `needs`, or `env` there. Composite actions' internal `uses:`
+      # refs ARE resolved at action-run time, where `inputs` is available, so
+      # the version concatenation happens inside the wrapper.
       #
       # After each shared-action step, a follow-up step posts a "ci-job-step-failed"
       # event to LD if (and only if) that step failed. LD correlates these events
@@ -130,7 +140,9 @@ jobs:
       # safe to commit (read/identifying only, no write or sensitive-data access).
       - name: SAST scan
         id: sast
-        uses: EmilHorne/gh-shared-actions-demo/.github/actions/sast-scan@sast-scan-${{ needs.evaluate-flags.outputs.sast-scan-version }}
+        uses: ./.github/actions/sast-scan-wrapper
+        with:
+          version: ${{ needs.evaluate-flags.outputs.sast-scan-version }}
 
       # always() suppresses the implicit success() check that GitHub Actions adds
       # to every if: condition — without it, this step would be skipped after the
@@ -166,7 +178,9 @@ jobs:
 
       - name: Secret scan
         id: secret
-        uses: EmilHorne/gh-shared-actions-demo/.github/actions/secret-scan@secret-scan-${{ needs.evaluate-flags.outputs.secret-scan-version }}
+        uses: ./.github/actions/secret-scan-wrapper
+        with:
+          version: ${{ needs.evaluate-flags.outputs.secret-scan-version }}
 
       - name: Publish failure event to LD (secret-scan)
         if: always() && steps.secret.outcome == 'failure'

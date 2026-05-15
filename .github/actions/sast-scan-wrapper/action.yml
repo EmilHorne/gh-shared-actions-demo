@@ -1,0 +1,18 @@
+name: SAST Scan (LD-versioned)
+description: |
+  Thin wrapper around the versioned sast-scan shared action. Exists because
+  GitHub Actions does not allow expressions like ${{ needs.*.outputs.* }} in
+  step-level `uses:` refs at the workflow level — but DOES allow them inside
+  a composite action's internal `uses:` (resolved at action-run time, not
+  workflow-parse time). The wrapper takes the LD-resolved version as an
+  input and dispatches to the corresponding ref.
+
+inputs:
+  version:
+    description: Version suffix (v1, v2, stable, ...) resolved by LaunchDarkly.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - uses: EmilHorne/gh-shared-actions-demo/.github/actions/sast-scan@sast-scan-${{ inputs.version }}
