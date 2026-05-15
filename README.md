@@ -6,11 +6,9 @@ Demonstrates routing a CI job to a specific version of each shared GitHub compos
 
 - `.github/actions/sast-scan/` — first shared action (the versioned one)
 - `.github/actions/secret-scan/` — second shared action (the versioned one)
-- `.github/actions/sast-scan-wrapper/` — local composite action that takes the LD-resolved version as an input and dispatches to the right `@sast-scan-<version>` ref at action-run time
-- `.github/actions/secret-scan-wrapper/` — same wrapper pattern for `secret-scan`
 - `.github/workflows/ci.yml` — consumer CI workflow
 
-The wrappers exist because GitHub Actions resolves step-level `uses:` refs at workflow-parse time and rejects expressions referencing `steps`, `needs`, or `env` there (a security feature for org-level third-party-actions policies). Composite actions' internal `uses:` refs ARE resolved at action-run time, so the version concatenation happens one layer in. The wrappers are thin and stable — they don't need their own LD-driven versioning. A separate flag controls each *versioned* shared action so the two roll out independently.
+A separate flag controls each action's version, so the two roll out independently. The workflow uses [`jenseng/dynamic-uses`](https://github.com/jenseng/dynamic-uses) as a dispatcher because GitHub Actions resolves step-level `uses:` refs at workflow-parse time and rejects expressions referencing `steps`, `needs`, `inputs`, or `env` there (a security feature for org-level third-party-actions policies). The dispatcher's own `uses:` is static, but its `with:` block accepts any context, and it invokes the target action dynamically at runtime. For enterprise deployment, pin the dispatcher to a specific SHA, or fork/replicate it inside the central-IT repo.
 
 ## How it works
 
@@ -18,7 +16,7 @@ When CI runs:
 
 1. The `launchdarkly/gha-flags` step evaluates `sast-scan-version` and `secret-scan-version`, passing a per-run context key (composite of `GITHUB_REPOSITORY_ID`, `GITHUB_RUN_NUMBER`, and `GITHUB_RUN_ATTEMPT`) so percentage and guarded rollouts randomize per CI job run — not per consumer team or repository. (FN1)
 2. LD evaluates targeting rules using the auto-included GitHub metadata (repository, ref, actor, etc.) plus `LD_appid`, a custom attribute the consumer sets to identify the calling application/team.
-3. Each subsequent step invokes a local wrapper composite action (`./.github/actions/sast-scan-wrapper`, etc.) passing the LD-returned value as a `version` input. The wrapper internally pins its `uses:` ref to `@sast-scan-<version>` (resolving to `sast-scan-v1`, `sast-scan-v2`, or `sast-scan-stable` depending on what LD returned). Each action's refs are versioned and advanced independently. (FN2)
+3. Each subsequent step invokes the `jenseng/dynamic-uses` dispatcher with a `uses:` parameter built from the action name prefix and the LD-returned version: e.g., `EmilHorne/gh-shared-actions-demo/.github/actions/sast-scan@sast-scan-${{ needs.evaluate-flags.outputs.sast-scan-version }}` resolves to `sast-scan-v1`, `sast-scan-v2`, or `sast-scan-stable` depending on what LD returned. Each action's refs are versioned and advanced independently. (FN2)
 
 (FN1) **Randomization is scoped, not global.** LD rollouts have two independent levers: *targeting rules* define **eligibility** (which CI runs can participate in the rollout at all), and the *randomization unit* assigns variations **within the eligible pool**. To restrict eligibility by repository name, target on the `Github.key` attribute (set by `gha-flags` from `GITHUB_REPOSITORY`); to restrict by consuming team or application, target on `GithubCustomAttributes.appid` (set from the `LD_appid` env var). Variations are then distributed across the eligible CI runs using `GithubCustomAttributes` as the randomization unit, keyed by the per-run `CI_JOB_ID`. A rollout might say *"of all CI runs from `appid in {team-a, team-b}`, send 10% to v2"* — eligibility limits the pool, randomization picks who within the pool gets the new variation.
 
