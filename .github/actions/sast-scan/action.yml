@@ -4,4 +4,4 @@ runs:
   using: composite
   steps:
     - shell: bash
-      run: echo "Running SAST scan — shared action v1"
+      run: echo "Running SAST scan — shared action v2"
