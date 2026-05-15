@@ -1,32 +1,48 @@
 name: CI
 
+# This workflow is split into two jobs (evaluate-flags, ci) to work around a
+# GitHub Actions constraint: expressions inside `uses:` refs at the step level
+# cannot reference the `steps` context. The evaluate-flags job resolves the
+# LD-driven versions and exposes them as job outputs; the ci job consumes them
+# via `needs.evaluate-flags.outputs.*`, which IS an allowed context in `uses:`.
+
 on:
   push:
   workflow_dispatch:
 
+# Defined once at workflow level so gha-flags picks it up as a custom context
+# attribute (it scans process.env for LD_* prefixed vars) AND the failure-event
+# payloads below can reference the same value without duplication.
+env:
+  LD_appid: demo-app-team-a
+
 jobs:
-  ci:
+  evaluate-flags:
     runs-on: ubuntu-latest
     env:
-      # Globally-unique, deterministic identifier for this CI job run. Used as
-      # the LD context-key at flag-evaluation time AND echoed back as the
-      # contextKeys value in the failure events posted below, so LD can:
-      #   (a) randomize variation selection per CI job run for percentage and
-      #       guarded rollouts (without this, every CI run would share the
-      #       default context key and all map into the same rollout bucket), and
-      #   (b) correlate each failure event to the variation that was served to
-      #       that exact run.
+      # Globally-unique, deterministic identifier for this CI workflow run.
+      # Used as the LD context-key at flag-evaluation time, then passed as a
+      # job output so the ci job uses the *same* value for its failure events
+      # — which is what lets LD correlate failure metrics back to the exact
+      # context that received each flag variation. Computed in one place to
+      # ensure the two values can never drift.
       CI_JOB_ID: ${{ github.repository_id }}-${{ github.run_number }}-${{ github.run_attempt }}
     permissions:
       contents: write  # required by the change-freeze snapshot-refresh step
+    outputs:
+      sast-scan-version: ${{ steps.ld.outputs.sast-scan-version }}
+      secret-scan-version: ${{ steps.ld.outputs.secret-scan-version }}
+      ci-job-id: ${{ env.CI_JOB_ID }}
     steps:
       - name: Check out repo
         uses: actions/checkout@v4
 
       # Ask LaunchDarkly which version of each shared action this CI run should use.
       # The action auto-includes GitHub metadata (repository, ref, actor, etc.) as
-      # custom context attributes. We add LD_appid so LD can target by the
-      # *consuming* team/application, since many teams can share one repo or branch.
+      # custom context attributes. LD_appid (set at workflow level above) lets LD
+      # target by the *consuming* team/application, since many teams can share one
+      # repo or branch.
+      #
       # The ",stable" suffix is the inline default returned only when BOTH the
       # central IT-operated LD Relay Proxy tier AND LD SaaS are unreachable from
       # this runner (see README.md for the full architecture). Using a movable
@@ -51,8 +67,6 @@ jobs:
           # base-uri:   https://ld-relay.internal
           # stream-uri: https://ld-relay.internal
           # events-uri: https://ld-relay.internal
-        env:
-          LD_appid: demo-app-team-a
 
       - name: Show selected versions
         run: |
@@ -87,8 +101,18 @@ jobs:
             git push
           fi
 
-      # Each step pins its @ref to the value LaunchDarkly returned. Two separate
-      # flags means the two shared actions roll out independently.
+  ci:
+    needs: evaluate-flags
+    runs-on: ubuntu-latest
+    env:
+      # Consumed from evaluate-flags so we use the exact same value LD saw at
+      # flag-evaluation time. The two contexts must match by key for failure
+      # events here to correlate against the variation served there.
+      CI_JOB_ID: ${{ needs.evaluate-flags.outputs.ci-job-id }}
+    steps:
+      # Each step pins its @ref by concatenating the action name prefix with
+      # the version resolved by the evaluate-flags job. Two separate LD flags
+      # means the two shared actions roll out independently.
       #
       # After each shared-action step, a follow-up step posts a "ci-job-step-failed"
       # event to LD if (and only if) that step failed. LD correlates these events
@@ -106,7 +130,7 @@ jobs:
       # safe to commit (read/identifying only, no write or sensitive-data access).
       - name: SAST scan
         id: sast
-        uses: EmilHorne/gh-shared-actions-demo/.github/actions/sast-scan@sast-scan-${{ steps.ld.outputs.sast-scan-version }}
+        uses: EmilHorne/gh-shared-actions-demo/.github/actions/sast-scan@sast-scan-${{ needs.evaluate-flags.outputs.sast-scan-version }}
 
       # always() suppresses the implicit success() check that GitHub Actions adds
       # to every if: condition — without it, this step would be skipped after the
@@ -123,8 +147,8 @@ jobs:
               "contextKeys": {"GithubCustomAttributes": "${{ env.CI_JOB_ID }}"},
               "data": {
                 "action": "sast-scan",
-                "version": "${{ steps.ld.outputs.sast-scan-version }}",
-                "appid": "demo-app-team-a",
+                "version": "${{ needs.evaluate-flags.outputs.sast-scan-version }}",
+                "appid": "${{ env.LD_appid }}",
                 "repository": "${{ github.repository }}",
                 "ref": "${{ github.ref }}",
                 "sha": "${{ github.sha }}",
@@ -142,7 +166,7 @@ jobs:
 
       - name: Secret scan
         id: secret
-        uses: EmilHorne/gh-shared-actions-demo/.github/actions/secret-scan@secret-scan-${{ steps.ld.outputs.secret-scan-version }}
+        uses: EmilHorne/gh-shared-actions-demo/.github/actions/secret-scan@secret-scan-${{ needs.evaluate-flags.outputs.secret-scan-version }}
 
       - name: Publish failure event to LD (secret-scan)
         if: always() && steps.secret.outcome == 'failure'
@@ -156,8 +180,8 @@ jobs:
               "contextKeys": {"GithubCustomAttributes": "${{ env.CI_JOB_ID }}"},
               "data": {
                 "action": "secret-scan",
-                "version": "${{ steps.ld.outputs.secret-scan-version }}",
-                "appid": "demo-app-team-a",
+                "version": "${{ needs.evaluate-flags.outputs.secret-scan-version }}",
+                "appid": "${{ env.LD_appid }}",
                 "repository": "${{ github.repository }}",
                 "ref": "${{ github.ref }}",
                 "sha": "${{ github.sha }}",
