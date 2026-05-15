@@ -35,7 +35,7 @@ jobs:
       ci-job-id: ${{ env.CI_JOB_ID }}
     steps:
       - name: Check out repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       # Ask LaunchDarkly which version of each shared action this CI run should use.
       # The action auto-includes GitHub metadata (repository, ref, actor, etc.) as
