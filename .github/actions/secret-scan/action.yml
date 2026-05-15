@@ -1,0 +1,7 @@
+name: Secret Scan
+description: Detect committed secrets (demo shared action).
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: echo "Running secret scan — shared action v1"

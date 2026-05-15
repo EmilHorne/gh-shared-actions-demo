@@ -1,0 +1,174 @@
+name: CI
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    env:
+      # Globally-unique, deterministic identifier for this CI job run. Used as
+      # the LD context-key at flag-evaluation time AND echoed back as the
+      # contextKeys value in the failure events posted below, so LD can:
+      #   (a) randomize variation selection per CI job run for percentage and
+      #       guarded rollouts (without this, every CI run would share the
+      #       default context key and all map into the same rollout bucket), and
+      #   (b) correlate each failure event to the variation that was served to
+      #       that exact run.
+      CI_JOB_ID: ${{ github.repository_id }}-${{ github.run_number }}-${{ github.run_attempt }}
+    permissions:
+      contents: write  # required by the change-freeze snapshot-refresh step
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      # Ask LaunchDarkly which version of each shared action this CI run should use.
+      # The action auto-includes GitHub metadata (repository, ref, actor, etc.) as
+      # custom context attributes. We add LD_appid so LD can target by the
+      # *consuming* team/application, since many teams can share one repo or branch.
+      # The ",stable" suffix is the inline default returned only when BOTH the
+      # central IT-operated LD Relay Proxy tier AND LD SaaS are unreachable from
+      # this runner (see README.md for the full architecture). Using a movable
+      # "stable" branch (rather than a fixed "v1") means the central team can
+      # advance the floor over time without anyone editing this file.
+      - name: Evaluate LaunchDarkly flags
+        id: ld
+        uses: launchdarkly/gha-flags@v1.0.4
+        with:
+          sdk-key: ${{ secrets.LD_SDK_KEY }}
+          context-key: ${{ env.CI_JOB_ID }}
+          flags: |
+            sast-scan-version,stable
+            secret-scan-version,stable
+          # Production deployment: point gha-flags at central IT's LD Relay Proxy
+          # tier (a pair of relays behind a load balancer, each with a backing
+          # database such as Redis, DynamoDB, or Consul) instead of LD SaaS. The
+          # relay persists flag config and continues serving when SaaS is
+          # degraded. Uncomment and set all three URIs to the load balancer
+          # fronting your relay tier. See README.md "What's the failure mode if
+          # the LD SaaS endpoint is down?" for the full architecture.
+          # base-uri:   https://ld-relay.internal
+          # stream-uri: https://ld-relay.internal
+          # events-uri: https://ld-relay.internal
+        env:
+          LD_appid: demo-app-team-a
+
+      - name: Show selected versions
+        run: |
+          echo "sast-scan   → ${{ steps.ld.outputs.sast-scan-version }}"
+          echo "secret-scan → ${{ steps.ld.outputs.secret-scan-version }}"
+
+      # Refresh the change-freeze snapshot. The committed ld-flag-values-for-ci.json
+      # captures the resolved values from the most recent main-branch run, giving the
+      # consuming team a reproducible source of truth they can pin to during a change
+      # freeze (e.g., year-end close). A planned enhancement to launchdarkly/gha-flags
+      # would let the action read from this file in freeze-mode; outside a freeze the
+      # file is maintained as a side effect of normal operation. The format follows
+      # the Node.js SDK's "flags from a file" schema. The [skip ci] tag on the commit
+      # prevents this maintenance push from triggering a recursive CI run.
+      # See "Alternatives and FAQ" in README.md for the full framing.
+      - name: Refresh change-freeze snapshot
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          cat > ld-flag-values-for-ci.json <<JSON
+          {
+            "flagValues": {
+              "sast-scan-version": "${{ steps.ld.outputs.sast-scan-version }}",
+              "secret-scan-version": "${{ steps.ld.outputs.secret-scan-version }}"
+            }
+          }
+          JSON
+          if [[ -n "$(git status --porcelain ld-flag-values-for-ci.json)" ]]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add ld-flag-values-for-ci.json
+            git commit -m "chore: refresh LD flag snapshot [skip ci]"
+            git push
+          fi
+
+      # Each step pins its @ref to the value LaunchDarkly returned. Two separate
+      # flags means the two shared actions roll out independently.
+      #
+      # After each shared-action step, a follow-up step posts a "ci-job-step-failed"
+      # event to LD if (and only if) that step failed. LD correlates these events
+      # against the flag variation that was served by matching the contextKeys
+      # below to the multi-context that gha-flags sent at evaluation time. The
+      # gha-flags action registers our CI_JOB_ID under context kind
+      # "GithubCustomAttributes" (see src/action.js in the gha-flags repo), so the
+      # publish steps reference that same kind name. For this correlation to drive
+      # a guarded rollout, the rollout in LD must be configured with
+      # GithubCustomAttributes as its randomization unit — see README.md.
+      #
+      # The events go to the client-side import endpoint, so the client-side ID is
+      # sufficient — no SDK key needed for posting events. The client-side ID is
+      # the same value for all consuming teams of a given LD environment and is
+      # safe to commit (read/identifying only, no write or sensitive-data access).
+      - name: SAST scan
+        id: sast
+        uses: EmilHorne/gh-shared-actions-demo/.github/actions/sast-scan@sast-scan-${{ steps.ld.outputs.sast-scan-version }}
+
+      # always() suppresses the implicit success() check that GitHub Actions adds
+      # to every if: condition — without it, this step would be skipped after the
+      # SAST step failed. The outcome check then narrows to the specific failure.
+      - name: Publish failure event to LD (sast-scan)
+        if: always() && steps.sast.outcome == 'failure'
+        run: |
+          payload=$(cat <<JSON
+          [
+            {
+              "kind": "custom",
+              "key": "ci-job-step-failed",
+              "creationDate": $(date +%s%3N),
+              "contextKeys": {"GithubCustomAttributes": "${{ env.CI_JOB_ID }}"},
+              "data": {
+                "action": "sast-scan",
+                "version": "${{ steps.ld.outputs.sast-scan-version }}",
+                "appid": "demo-app-team-a",
+                "repository": "${{ github.repository }}",
+                "ref": "${{ github.ref }}",
+                "sha": "${{ github.sha }}",
+                "run_id": "${{ github.run_id }}"
+              }
+            }
+          ]
+          JSON
+          )
+          curl -fsS -X POST \
+            -H 'Content-Type: application/json' \
+            -H 'X-LaunchDarkly-Event-Schema: 4' \
+            -d "$payload" \
+            https://events.launchdarkly.com/events/bulk/69de5ab6eeee720ae40a9a99
+
+      - name: Secret scan
+        id: secret
+        uses: EmilHorne/gh-shared-actions-demo/.github/actions/secret-scan@secret-scan-${{ steps.ld.outputs.secret-scan-version }}
+
+      - name: Publish failure event to LD (secret-scan)
+        if: always() && steps.secret.outcome == 'failure'
+        run: |
+          payload=$(cat <<JSON
+          [
+            {
+              "kind": "custom",
+              "key": "ci-job-step-failed",
+              "creationDate": $(date +%s%3N),
+              "contextKeys": {"GithubCustomAttributes": "${{ env.CI_JOB_ID }}"},
+              "data": {
+                "action": "secret-scan",
+                "version": "${{ steps.ld.outputs.secret-scan-version }}",
+                "appid": "demo-app-team-a",
+                "repository": "${{ github.repository }}",
+                "ref": "${{ github.ref }}",
+                "sha": "${{ github.sha }}",
+                "run_id": "${{ github.run_id }}"
+              }
+            }
+          ]
+          JSON
+          )
+          curl -fsS -X POST \
+            -H 'Content-Type: application/json' \
+            -H 'X-LaunchDarkly-Event-Schema: 4' \
+            -d "$payload" \
+            https://events.launchdarkly.com/events/bulk/69de5ab6eeee720ae40a9a99

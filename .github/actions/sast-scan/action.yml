@@ -1,0 +1,7 @@
+name: SAST Scan
+description: Static application security testing (demo shared action).
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: echo "Running SAST scan — shared action v1"
