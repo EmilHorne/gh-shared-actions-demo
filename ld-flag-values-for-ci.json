@@ -1,6 +1,6 @@
 {
   "flagValues": {
-    "sast-scan-version": "v1",
+    "sast-scan-version": "v2",
     "secret-scan-version": "stable"
   }
 }
